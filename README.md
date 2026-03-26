@@ -137,11 +137,6 @@ python train_eegnet.py
 
 ---
 
-## 기술 스택 | Tech Stack
-
-`Python` · `PyTorch` · `MNE-Python` · `scikit-learn` · `NumPy` · `Matplotlib`
-
----
 
 ## 참고 문헌 | References
 
