@@ -1,0 +1,180 @@
+import mne
+import numpy as np
+from pathlib import Path
+
+# =============================================================
+# 설정
+# =============================================================
+DATA_DIR  = Path('/home/gcr/BCI_IV')
+SAVE_DIR  = Path('/home/gcr/BCI_IV/preprocessed')
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+SUBJECTS  = [f"A0{i}" for i in range(1, 10)]
+SESSIONS  = ["T"]
+
+SFREQ     = 250          # BCI IV 2a 샘플링 주파수
+WIN_SIZE  = int(2.0 * SFREQ)   # 2초 = 500 samples
+WIN_STEP  = int(0.1 * SFREQ)   # 0.1초 shift = 25 samples
+
+ch_names_22 = [
+    "Fz",  "FC3", "FC1", "FCz", "FC2", "FC4",
+    "C5",  "C3",  "C1",  "Cz",  "C2",  "C4",  "C6",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "P1",  "Pz",  "P2",  "POz"
+]
+
+reject_criteria = dict(eeg=150e-6)
+
+cue_map = {"769": "left", "770": "right", "771": "foot", "772": "tongue"}
+class_to_int = {"left": 0, "right": 1, "foot": 2, "tongue": 3}
+
+
+# =============================================================
+# 슬라이딩 윈도우 함수
+# =============================================================
+def sliding_window(X_epochs, y_epochs, win_size, win_step):
+    """
+    X_epochs: (N_epoch, 22, T)
+    반환:
+      X_win:      (N_win, 22, win_size)
+      y_win:      (N_win,)
+      epoch_idx:  (N_win,) - 각 윈도우가 어느 epoch에서 왔는지 (CV split용)
+    """
+    X_win, y_win, epoch_idx = [], [], []
+
+    n_epochs, n_ch, n_times = X_epochs.shape
+    for i in range(n_epochs):
+        start = 0
+        while start + win_size <= n_times:
+            window = X_epochs[i, :, start:start + win_size]
+            X_win.append(window)
+            y_win.append(y_epochs[i])
+            epoch_idx.append(i)
+            start += win_step
+
+    X_win     = np.array(X_win, dtype=np.float32)   # (N_win, 22, win_size)
+    y_win     = np.array(y_win, dtype=np.int64)
+    epoch_idx = np.array(epoch_idx, dtype=np.int64)
+
+    return X_win, y_win, epoch_idx
+
+
+# =============================================================
+# 전처리 함수
+# =============================================================
+def preprocess(file_path: Path):
+    raw = mne.io.read_raw_gdf(str(file_path), preload=True, verbose=False)
+
+    mapping = {raw.ch_names[i]: ch_names_22[i] for i in range(22)}
+    raw.rename_channels(mapping)
+
+    for eog_ch in ["EOG-left", "EOG-central", "EOG-right"]:
+        if eog_ch in raw.ch_names:
+            raw.set_channel_types({eog_ch: "eog"})
+
+    raw.filter(
+        l_freq=1.0, h_freq=45.0,
+        method="iir",
+        iir_params=dict(order=5, ftype="butter"),
+        picks="eeg",
+        verbose=False
+    )
+    raw = raw.pick("eeg")
+
+    events, event_id = mne.events_from_annotations(raw, verbose=False)
+
+    cue_event_id = {label: event_id[code]
+                    for code, label in cue_map.items() if code in event_id}
+    if not cue_event_id:
+        print(f"  [SKIP] cue 이벤트 없음: {file_path.name}")
+        return None, None, None
+
+    code_trial = event_id.get("768")
+    code_rej   = event_id.get("1023")
+
+    if code_trial is None:
+        print(f"  [SKIP] trial 시작 이벤트 없음: {file_path.name}")
+        return None, None, None
+
+    trial_starts = np.sort(events[events[:, 2] == code_trial][:, 0])
+    rej_pos = events[events[:, 2] == code_rej][:, 0] if code_rej else np.array([])
+
+    good_events = []
+    for s, _, c in events:
+        if c not in cue_event_id.values():
+            continue
+        idx = np.searchsorted(trial_starts, s, side="right") - 1
+        if idx < 0:
+            continue
+        t0 = trial_starts[idx]
+        t1 = trial_starts[idx + 1] if idx + 1 < len(trial_starts) else raw.n_times
+        if len(rej_pos) == 0 or not np.any((rej_pos >= t0) & (rej_pos < t1)):
+            good_events.append([s, 0, c])
+
+    if not good_events:
+        print(f"  [SKIP] good epoch 없음: {file_path.name}")
+        return None, None, None
+
+    good_events = np.array(good_events, dtype=int)
+
+    epochs = mne.Epochs(
+        raw, good_events, event_id=cue_event_id,
+        tmin=-0.2, tmax=4.0,
+        baseline=(-0.2, 0.0),  # 자극 전 200ms → 표준 baseline correction
+        reject=reject_criteria,
+        preload=True, verbose=False
+    )
+    epochs_mi = epochs.copy().crop(tmin=1.0, tmax=4.0)  # MI 구간만 (shape 동일)
+
+    # epoch 단위 z-score
+    X = epochs_mi.get_data().astype(np.float32)   # (N, 22, T)
+    mean = X.mean(axis=-1, keepdims=True)
+    std  = X.std(axis=-1,  keepdims=True)
+    X    = (X - mean) / (std + 1e-8)
+
+    y_code = epochs_mi.events[:, 2]
+    inv    = {v: k for k, v in cue_event_id.items()}
+    y      = np.array([class_to_int[inv[c]] for c in y_code], dtype=np.int64)
+
+    # 슬라이딩 윈도우 적용
+    X_win, y_win, epoch_idx = sliding_window(X, y, WIN_SIZE, WIN_STEP)
+
+    # (N_win, 1, 22, win_size) 형태로 변환
+    X_win = X_win[:, np.newaxis, :, :]
+
+    return X_win, y_win, epoch_idx
+
+
+# =============================================================
+# 전체 실행
+# =============================================================
+summary = []
+
+for subj in SUBJECTS:
+    for sess in SESSIONS:
+        file_path = DATA_DIR / f"{subj}{sess}.gdf"
+
+        if not file_path.exists():
+            print(f"[NOT FOUND] {file_path.name}")
+            continue
+
+        print(f"Processing {file_path.name} ...", end=" ")
+
+        X, y, epoch_idx = preprocess(file_path)
+
+        if X is None:
+            continue
+
+        save_path = SAVE_DIR / f"{subj}{sess}_preprocessed.npz"
+        np.savez(save_path, X=X, y=y, epoch_idx=epoch_idx)
+
+        n_epochs = epoch_idx.max() + 1
+        wins_per_epoch = len(X) / n_epochs
+        print(f"X={X.shape}, y={y.shape}  "
+              f"(원본 {n_epochs} epochs × ~{wins_per_epoch:.1f} windows)")
+        summary.append({"file": file_path.name, "n_win": len(X), "shape": X.shape})
+
+print("\n=== 완료 ===")
+for s in summary:
+    print(f"  {s['file']:15s}  windows={s['n_win']}  shape={s['shape']}")
+print(f"\n저장 위치: {SAVE_DIR}")
