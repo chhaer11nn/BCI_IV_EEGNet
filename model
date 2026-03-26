@@ -1,0 +1,254 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from pathlib import Path
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score, roc_auc_score, precision_score, accuracy_score
+from sklearn.preprocessing import label_binarize
+
+# =============================================================
+# 설정
+# =============================================================
+DATA_DIR  = Path('/home/gcr/BCI_IV/preprocessed')
+DEVICE    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+SUBJECTS  = [f"A0{i}" for i in range(1, 10)]
+
+N_CLASSES  = 4
+N_TIMES    = 500
+N_CHS      = 22
+
+F1 = 8
+D  = 2
+F2 = 16
+DROPOUT = 0.5
+
+LR           = 1e-3
+WEIGHT_DECAY = 1e-4
+PATIENCE     = 50
+BATCH_SIZE   = 64
+EPOCHS       = 300  # 고정 (논문 방식, val 없음)
+
+
+# =============================================================
+# EEGNet
+# =============================================================
+class EEGNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(1, F1, (1, 125), padding=(0, 62), bias=False),
+            nn.BatchNorm2d(F1),
+            nn.Conv2d(F1, F1 * D, (N_CHS, 1), groups=F1, bias=False),
+            nn.BatchNorm2d(F1 * D),
+            nn.ELU(),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(DROPOUT)
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(F1 * D, F1 * D, (1, 16), padding=(0, 8), groups=F1 * D, bias=False),
+            nn.Conv2d(F1 * D, F2, (1, 1), bias=False),
+            nn.BatchNorm2d(F2),
+            nn.ELU(),
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(DROPOUT)
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, N_CHS, N_TIMES)
+            out   = self.block2(self.block1(dummy))
+            self._flat_size = out.numel()
+
+        self.classifier = nn.Linear(self._flat_size, N_CLASSES)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+
+# =============================================================
+# 학습
+# =============================================================
+def train(X_train, y_train, X_test, y_test):
+    train_loader = DataLoader(
+        TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
+        batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(
+        TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
+        batch_size=BATCH_SIZE, shuffle=False)
+
+    model     = EEGNet().to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    criterion = nn.CrossEntropyLoss()
+
+    best_weights = None
+    tr_losses, te_losses = [], []
+    tr_accs, te_accs = [], []
+
+    for epoch in range(EPOCHS):
+        model.train()
+        tr_loss, tr_correct, tr_total = 0.0, 0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            out  = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            tr_loss    += loss.item() * xb.size(0)
+            tr_correct += (out.argmax(1) == yb).sum().item()
+            tr_total   += xb.size(0)
+        scheduler.step()
+
+        model.eval()
+        te_loss, te_correct, te_total = 0.0, 0, 0
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                out = model(xb)
+                te_loss    += criterion(out, yb).item() * xb.size(0)
+                te_correct += (out.argmax(1) == yb).sum().item()
+                te_total   += xb.size(0)
+
+        tr_losses.append(tr_loss / tr_total)
+        te_losses.append(te_loss / te_total)
+        tr_accs.append(tr_correct / tr_total)
+        te_accs.append(te_correct / te_total)
+
+    return model, tr_losses, te_losses, tr_accs, te_accs
+
+
+# =============================================================
+# 평가
+# =============================================================
+def evaluate(model, X_test, y_test, print_onehot=True):
+    loader = DataLoader(
+        TensorDataset(torch.tensor(X_test), torch.tensor(y_test)),
+        batch_size=BATCH_SIZE, shuffle=False)
+
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(DEVICE)
+            logits = model(xb)
+            probs  = torch.softmax(logits, dim=1)
+            all_preds.append(logits.argmax(1).cpu())
+            all_labels.append(yb)
+            all_probs.append(probs.cpu())
+
+    all_preds  = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    all_probs  = torch.cat(all_probs).numpy()
+
+    acc       = accuracy_score(all_labels, all_preds)
+    f1        = f1_score(all_labels, all_preds, average="macro")
+    precision = precision_score(all_labels, all_preds, average="macro", zero_division=0)
+    labels_bin = label_binarize(all_labels, classes=list(range(N_CLASSES)))
+    auc        = roc_auc_score(labels_bin, all_probs, average="macro", multi_class="ovr")
+
+    print(f"  Accuracy={acc:.4f}  Precision={precision:.4f}  F1={f1:.4f}  AUC={auc:.4f}")
+    return acc, f1, precision, auc
+
+
+# =============================================================
+# loss curve
+# =============================================================
+def plot_curves(tr_losses, te_losses, tr_accs, te_accs, subj):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(tr_losses, label="Train Loss")
+    axes[0].plot(te_losses, label="Test Loss (E)", linestyle="--", linewidth=1.5)
+    axes[0].set_title(f"{subj} T→E | Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(tr_accs, label="Train Acc")
+    axes[1].plot(te_accs, label="Test Acc (E)", linestyle="--", linewidth=1.5)
+    axes[1].axhline(y=0.25, color="gray", linestyle=":", linewidth=1, label="Chance")
+    axes[1].set_title(f"{subj} T→E | Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylim(0, 1)
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"{subj}_TE_curves.png", dpi=100)
+    plt.show()
+    plt.close()
+
+
+# =============================================================
+# 메인
+# =============================================================
+print(f"Device: {DEVICE}")
+print("Mode: Within-subject  T → E  (논문 표준 방식)")
+
+results = []
+skipped = []
+
+for subj_num in range(1, 10):
+    subj = f"A0{subj_num}"
+    t_npz = DATA_DIR / f"{subj}T_preprocessed.npz"
+    e_npz = DATA_DIR / f"{subj}E_preprocessed.npz"
+
+    # 파일 존재 확인
+    if not t_npz.exists():
+        print(f"\n[SKIP] {subj}T npz 없음")
+        skipped.append(subj)
+        continue
+    if not e_npz.exists():
+        print(f"\n[SKIP] {subj}E npz 없음 → preprocess_E.py 먼저 실행하세요")
+        skipped.append(subj)
+        continue
+
+    # ── 데이터 로드 ──────────────────────────────────────────
+    t_data = np.load(t_npz)
+    e_data = np.load(e_npz)
+
+    X_tr_all = t_data['X']
+    y_tr_all = t_data['y']
+    X_te     = e_data['X']
+    y_te     = e_data['y']
+
+    print(f"\n{'='*55}")
+    print(f"Subject: {subj}  |  train={len(X_tr_all)}win  test={len(X_te)}win")
+    print(f"{'='*55}")
+
+    # ── 학습 ────────────────────────────────────────────────
+    model, tr_losses, te_losses, tr_accs, te_accs = \
+        train(X_tr_all, y_tr_all, X_te, y_te)
+
+    # ── 테스트 ──────────────────────────────────────────────
+    acc, f1, precision, auc = evaluate(model, X_te, y_te, print_onehot=True)
+
+    plot_curves(tr_losses, te_losses, tr_accs, te_accs, subj)
+    results.append((subj, acc, f1, precision, auc))
+
+# =============================================================
+# 최종 요약
+# =============================================================
+print(f"\n{'='*55}")
+print("최종 결과 요약  (T → E, within-subject)")
+print(f"{'='*55}")
+print(f"  {'Subject':<8} {'Accuracy':>9} {'Precision':>10} {'F1':>8} {'AUC':>8}")
+print(f"  {'-'*47}")
+for subj, acc, f1, precision, auc in results:
+    print(f"  {subj:<8} {acc:>9.4f} {precision:>10.4f} {f1:>8.4f} {auc:>8.4f}")
+
+if results:
+    accs  = [r[1] for r in results]
+    f1s   = [r[2] for r in results]
+    precs = [r[3] for r in results]
+    aucs  = [r[4] for r in results]
+    print(f"  {'-'*47}")
+    print(f"  {'Mean':<8} {np.mean(accs):>9.4f} {np.mean(precs):>10.4f} {np.mean(f1s):>8.4f} {np.mean(aucs):>8.4f}")
+    print(f"  {'Std':<8} {np.std(accs):>9.4f} {np.std(precs):>10.4f} {np.std(f1s):>8.4f} {np.std(aucs):>8.4f}")
+if skipped:
+    print(f"\n스킵된 subject: {skipped}  (E 파일 없음)")
+print(f"\nchance level: 0.25 (4-class)")
